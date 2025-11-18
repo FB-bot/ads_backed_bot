@@ -5,7 +5,7 @@ from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
 BOT_TOKEN = os.environ.get("8213937413:AAHmp7SHCITYExufiYvQtEJJbZP7Svi4Uwg")
-API_BASE = os.environ.get("API_BASE", "https://your-server.example.com")  # আপনার Flask সার্ভারের URL
+API_BASE = os.environ.get("https://ads-backed-bot.onrender.com", "https://ads-backed-bot.onrender.com")  # আপনার Flask সার্ভারের URL
 REF_SECRET = os.environ.get("REF_SECRET")  # যদি আপনি সার্ভারে সিক্রেট হেডার চেক করেন
 
 REF_REGISTER_ENDPOINT = f"{API_BASE.rstrip('/')}/api/referral/register"
