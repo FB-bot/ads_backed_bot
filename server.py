@@ -11,18 +11,20 @@ from flask_cors import CORS
 import requests
 
 # ---------------- Config (via env) ----------------
-# ঠিক করা ENV লাইনগুলো:
 DB_PATH = os.environ.get("DB_PATH", "referral.db")
-REFERRAL_BONUS_CENTS = int(os.environ.get("REFERRAL_BONUS_CENTS", "50"))  # 50 cents => 0.5 USDT
+REFERRAL_BONUS_CENTS = int(os.environ.get("REFERRAL_BONUS_CENTS", "50"))
 
-# IMPORTANT: এখানে key-গুলা হলো নাম (not the token itself)
-BOT_TOKEN = os.environ.get("8213937413:AAHmp7SHCITYExufiYvQtEJJbZP7Svi4Uwg")                 # ex: 8213937413:AAHmp7...
-ADMIN_CHAT_ID = os.environ.get("1849126202")         # ex: 1849126202
-SECRET_TOKEN = os.environ.get("noobxvau")           # ex: noobxvau
-# flexible: check WEBHOOK_SECRET or legacy 'smartearn'
+# IMPORTANT: set these as environment variables in your Render dashboard
+BOT_TOKEN = os.environ.get("8213937413:AAHmp7SHCITYExufiYvQtEJJbZP7Svi4Uwg")                 # e.g. 8213937... (do NOT hardcode token in file)
+ADMIN_CHAT_ID = os.environ.get("1849126202")         # e.g. 1849126202
+SECRET_TOKEN = os.environ.get("noobxvau")           # e.g. noobxvau
+# flexible webhook secret (checks two possible env names)
 WEBHOOK_SECRET = os.environ.get("noobxvau") or os.environ.get("smartearn") or "change_me_secret"
-WEBAPP_URL = os.environ.get("https://mysmartearn.netlify.app/", "")           # ex: https://mysmartearn.netlify.app
-BOT_USERNAME = os.environ.get("@mysmartearn_bot", "")       # ex: mysmartearn_bot
+# your frontend webapp url (Netlify)
+WEBAPP_URL = os.environ.get("https://mysmartearn.netlify.app/", "")           # e.g. https://mysmartearn.netlify.app
+BOT_USERNAME = os.environ.get("@mysmartearn_bot", "")       # e.g. mysmartearn_bot
+# optional PUBLIC base url for building webhook if different
+PUBLIC_BASE_URL = os.environ.get("https://ads-backed-bot.onrender.com", "")  # e.g. https://ads-backed-bot.onrender.com
 
 app = Flask(__name__)
 CORS(app)
@@ -82,10 +84,6 @@ def compute_payload_hash(payload: dict) -> str:
     return hashlib.sha256(s.encode('utf-8')).hexdigest()
 
 def verify_telegram_initdata(init_data_string: str, bot_token: str) -> bool:
-    """
-    Verify Telegram WebApp initData string per Telegram docs.
-    init_data_string: full query string (e.g., "user=...&auth_date=...&hash=...")
-    """
     if not init_data_string or not bot_token:
         return False
     try:
@@ -108,6 +106,7 @@ def verify_telegram_initdata(init_data_string: str, bot_token: str) -> bool:
 
 def send_bot_message(chat_id: str, text: str, reply_markup: dict = None):
     if not BOT_TOKEN:
+        app.logger.warning("send_bot_message: BOT_TOKEN not configured")
         return False, "BOT_TOKEN not configured"
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     payload = {"chat_id": chat_id, "text": text, "parse_mode": "HTML"}
@@ -116,16 +115,44 @@ def send_bot_message(chat_id: str, text: str, reply_markup: dict = None):
     try:
         r = requests.post(url, json=payload, timeout=10)
         if r.ok:
+            app.logger.info("send_bot_message ok: chat_id=%s", chat_id)
             return True, r.json()
         else:
+            app.logger.warning("send_bot_message failed: status=%s resp=%s", r.status_code, r.text)
             return False, r.text
     except Exception as e:
+        app.logger.exception("send_bot_message exception: %s", e)
         return False, str(e)
+
+# ---------------- Simple index & health ----------------
+@app.route("/", methods=["GET"])
+def index():
+    host = PUBLIC_BASE_URL or WEBAPP_URL or request.url_root.rstrip("/")
+    webhook_url = f"{host}/telegram/webhook/{WEBHOOK_SECRET}" if host else f"/telegram/webhook/{WEBHOOK_SECRET}"
+    return f"""
+    <html>
+      <head><meta charset="utf-8"><title>Smart Earning API</title></head>
+      <body style="font-family: system-ui, sans-serif; padding:24px;">
+        <h2>Smart Earning — Backend</h2>
+        <p>Status: <strong>Running</strong></p>
+        <ul>
+          <li>Webhook URL (configured): <code>{webhook_url}</code></li>
+          <li><a href="/api/admin/users">/api/admin/users</a> — List users (protected by SECRET_TOKEN if set)</li>
+          <li><a href="/set-webhook">/set-webhook</a> — Set Telegram webhook (protected if SECRET_TOKEN)</li>
+          <li>/api/referral/register — POST endpoint (use client fetch)</li>
+        </ul>
+        <p style="color:#666;font-size:13px">Note: some routes require POST or SECRET_TOKEN; check logs for runtime info.</p>
+      </body>
+    </html>
+    """, 200
+
+@app.route("/health", methods=["GET"])
+def health():
+    return {"status":"ok","uptime": True}, 200
 
 # ---------------- Referral API ----------------
 @app.route("/api/referral/register", methods=["POST"])
 def register_referral():
-    # Optional header auth
     if SECRET_TOKEN:
         header = request.headers.get("X-API-KEY") or request.headers.get("Authorization")
         if not header or header != SECRET_TOKEN:
@@ -137,12 +164,11 @@ def register_referral():
 
     new_user_id = str(payload.get("newUserId", "")).strip()
     referrer_id = str(payload.get("referrerId", "")).strip()
-    init_data_string = payload.get("initDataString")  # optional
+    init_data_string = payload.get("initDataString")
 
     if not new_user_id or not referrer_id:
         return jsonify({"success": False, "error": "Missing newUserId or referrerId"}), 400
 
-    # If initData provided, verify it
     if init_data_string:
         if not BOT_TOKEN:
             return jsonify({"success": False, "error": "Server missing BOT_TOKEN for verification"}), 500
@@ -154,7 +180,6 @@ def register_referral():
     cur = db.cursor()
     payload_hash = compute_payload_hash(payload)
 
-    # Idempotency check
     cur.execute("SELECT id, credited FROM referrals WHERE payload_hash = ?", (payload_hash,))
     existing = cur.fetchone()
     if existing:
@@ -177,7 +202,6 @@ def register_referral():
     )
     referral_row_id = cur.lastrowid
 
-    # Ensure referrer exists
     cur.execute("SELECT id FROM users WHERE id = ?", (referrer_id,))
     if not cur.fetchone():
         cur.execute(
@@ -185,7 +209,6 @@ def register_referral():
             (referrer_id, payload.get("first_name"), payload.get("last_name"), payload.get("username"), now)
         )
 
-    # Credit referrer
     try:
         cur.execute(
             "UPDATE users SET balance_cents = balance_cents + ?, referral_count = referral_count + 1 WHERE id = ?",
@@ -197,17 +220,14 @@ def register_referral():
         db.rollback()
         return jsonify({"success": False, "error": "Database error", "details": str(e)}), 500
 
-    # Fetch updated info
     cur.execute("SELECT balance_cents, referral_count FROM users WHERE id = ?", (referrer_id,))
     r = cur.fetchone()
     balance_cents = r["balance_cents"] if r else 0
     referral_count = r["referral_count"] if r else 0
 
-    # Notify admin optionally
     try:
         if ADMIN_CHAT_ID:
-            text = f"✅ New referral credited\nReferrer: {referrer_id}\nNewUser: {new_user_id}\nAmount (cents): {REFERRAL_BONUS_CENTS}"
-            send_bot_message(ADMIN_CHAT_ID, text)
+            send_bot_message(ADMIN_CHAT_ID, f"✅ New referral credited\nReferrer: {referrer_id}\nNewUser: {new_user_id}\nAmount (cents): {REFERRAL_BONUS_CENTS}")
     except Exception:
         pass
 
@@ -221,34 +241,34 @@ def register_referral():
 # ---------------- Telegram webhook handling ----------------
 @app.route(f"/telegram/webhook/{WEBHOOK_SECRET}", methods=["POST"])
 def telegram_webhook():
-    # optional: verify secret token header from Telegram (if you configured setWebhook with secret_token)
+    # Optional: if you set secret_token in setWebhook, Telegram will include header X-Telegram-Bot-Api-Secret-Token
     # header_secret = request.headers.get("X-Telegram-Bot-Api-Secret-Token")
-    # if header_secret and header_secret != WEBHOOK_SECRET: abort(403)
+    # if header_secret and header_secret != WEBHOOK_SECRET:
+    #     abort(403)
 
     update = request.get_json(silent=True)
+    app.logger.info("TG update received: %s", json.dumps(update))
     if not update:
         return jsonify({"ok": False, "error": "no update"}), 400
 
     try:
-        # message updates (text commands like /start)
         if "message" in update:
             msg = update["message"]
             chat = msg.get("chat", {})
             chat_id = chat.get("id")
             text = msg.get("text", "") or ""
 
-            if text.strip().startswith("/start"):
+            if text and text.strip().startswith("/start"):
                 welcome_text = (
                     "স্বাগতম! 🎉\n\n"
                     "এই বটটি আপনাকে অ্যাড দেখিয়ে USDT আয় করতে সাহায্য করবে।\n"
                     "নীচের বাটন থেকে ওয়েব অ্যাপ খুলে কাজ শুরু করুন।"
                 )
-                # web_app button - use WEBAPP_URL if configured else a t.me link fallback
                 webapp_url = WEBAPP_URL or (f"https://t.me/{BOT_USERNAME}/{WEBAPP_URL.split('/')[-1]}" if BOT_USERNAME and WEBAPP_URL else "")
                 if not webapp_url:
-                    # fallback: tell user how to open
                     text2 = welcome_text + "\n\n(ওয়েবঅ্যাপ URL কনফিগার করা নেই।)"
-                    send_bot_message(chat_id, text2)
+                    ok, resp = send_bot_message(chat_id, text2)
+                    app.logger.info("send_bot_message -> ok=%s resp=%s", ok, resp)
                 else:
                     reply_markup = {
                         "inline_keyboard": [
@@ -257,19 +277,19 @@ def telegram_webhook():
                             ]
                         ]
                     }
-                    send_bot_message(chat_id, welcome_text, reply_markup)
+                    ok, resp = send_bot_message(chat_id, welcome_text, reply_markup)
+                    app.logger.info("send_bot_message -> ok=%s resp=%s", ok, resp)
 
                 return jsonify({"ok": True}), 200
 
-        # web_app_data (when Web App calls Telegram WebApp API to send data to bot)
         if "web_app_data" in update:
             wad = update["web_app_data"]
             chat = update.get("message", {}).get("chat", {})
             chat_id = chat.get("id")
             data = wad.get("data")
-            # simple acknowledgement
             ack = "ধন্যবাদ! আপনি Web App খুলেছেন।"
-            send_bot_message(chat_id, ack)
+            ok, resp = send_bot_message(chat_id, ack)
+            app.logger.info("send_bot_message -> ok=%s resp=%s", ok, resp)
             return jsonify({"ok": True}), 200
 
     except Exception as e:
@@ -281,10 +301,6 @@ def telegram_webhook():
 # ---------------- set-webhook helper (protected) ----------------
 @app.route("/set-webhook", methods=["POST", "GET"])
 def set_webhook():
-    """
-    Call this (once) to register webhook with Telegram.
-    Protect by SECRET_TOKEN (header or query param) if set.
-    """
     if SECRET_TOKEN:
         header = request.headers.get("X-API-KEY") or request.args.get("api_key") or request.headers.get("Authorization")
         if not header or header != SECRET_TOKEN:
@@ -293,19 +309,15 @@ def set_webhook():
     if not BOT_TOKEN:
         return jsonify({"success": False, "error": "BOT_TOKEN not configured"}), 500
 
-    # Build webhook URL
-    base_url = os.environ.get("PUBLIC_BASE_URL") or os.environ.get("WEBAPP_URL") or ""
+    base_url = PUBLIC_BASE_URL or WEBAPP_URL or ""
     if not base_url:
         return jsonify({"success": False, "error": "Set PUBLIC_BASE_URL or WEBAPP_URL env var to the deployed domain"}), 400
 
-    # Ensure no trailing slash
     base_url = base_url.rstrip("/")
-
     webhook_url = f"{base_url}/telegram/webhook/{WEBHOOK_SECRET}"
-    # Optional: secret_token parameter for Telegram (adds header X-Telegram-Bot-Api-Secret-Token to requests)
     params = {"url": webhook_url}
-    # If you want Telegram to include secret_token header, you can pass 'secret_token' param (Telegram supports)
-    # params["secret_token"] = WEBHOOK_SECRET
+    # If you want Telegram to include secret_token header, add:
+    params["secret_token"] = WEBHOOK_SECRET
 
     tg_url = f"https://api.telegram.org/bot{BOT_TOKEN}/setWebhook"
     try:
