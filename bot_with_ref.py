@@ -4,7 +4,6 @@ import json
 import logging
 import asyncio
 import requests
-
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
@@ -14,8 +13,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Read env vars at import time
-BOT_TOKEN = os.environ.get("8213937413:AAHmp7SHCITYExufiYvQtEJJbZP7Svi4Uwg")  # <-- ঠিক করা: ENV key "BOT_TOKEN"
+# read env vars
+BOT_TOKEN = os.environ.get("8213937413:AAHmp7SHCITYExufiYvQtEJJbZP7Svi4Uwg")  # <-- অবশ্যই Render/Env এ BOT_TOKEN সেট করুন
 API_BASE = os.environ.get("API_BASE", "http://127.0.0.1:5000")
 REF_SECRET = os.environ.get("REF_SECRET")  # optional
 
@@ -56,7 +55,6 @@ def extract_start_param(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return None
 
 async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # use effective_user / effective_message for robustness
     user = update.effective_user
     message = update.effective_message
 
@@ -89,7 +87,6 @@ async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     else:
                         await message.reply_text("Referral recorded earlier (no new credit).")
                 else:
-                    # API returned success=False
                     err_msg = j.get("error") or "Referral API returned error."
                     await message.reply_text(f"Referral API error: {err_msg}")
             except Exception:
