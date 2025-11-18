@@ -11,16 +11,13 @@ from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# Read env vars at import time but do NOT exit here.
 BOT_TOKEN = os.environ.get("8213937413:AAHmp7SHCITYExufiYvQtEJJbZP7Svi4Uwg")
 API_BASE = os.environ.get("API_BASE", "http://127.0.0.1:5000")
 REF_SECRET = os.environ.get("REF_SECRET")  # optional
 
-if not BOT_TOKEN:
-    logger.error("BOT_TOKEN is not set in environment variables.")
-    raise SystemExit("Set BOT_TOKEN env variable and retry.")
-
 async def post_referral_async(payload):
-    """Do blocking requests.post in thread to avoid blocking asyncio loop."""
+    """Post referral in a thread to avoid blocking asyncio loop."""
     headers = {"Content-Type": "application/json"}
     if REF_SECRET:
         headers["X-REF-SECRET"] = REF_SECRET
@@ -37,7 +34,6 @@ def extract_start_param(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # context.args works for /start <payload>
     if context.args:
         return context.args[0]
-    # fallback: parse text (rare)
     if update.message and update.message.text:
         parts = update.message.text.split()
         if len(parts) > 1:
@@ -72,9 +68,8 @@ async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         await update.message.reply_text("Referral recorded earlier (no new credit).")
                 else:
                     await update.message.reply_text("Referral API returned error.")
-            except Exception as e:
+            except Exception:
                 await update.message.reply_text("Bad response from referral server.")
-                logger.exception("parse error")
         else:
             await update.message.reply_text(f"Failed to contact referral server: {text}")
     else:
@@ -84,12 +79,15 @@ async def help_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("This bot supports referral links. Use t.me/YourBot?start=ref<your_id> to share.")
 
 def main():
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
+    if not BOT_TOKEN:
+        logger.error("BOT_TOKEN is not set in environment variables. Set BOT_TOKEN and restart bot.")
+        raise SystemExit("Set BOT_TOKEN environment variable and retry.")
 
+    app = ApplicationBuilder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start_handler))
     app.add_handler(CommandHandler("help", help_handler))
 
-    logger.info("Starting bot...")
+    logger.info("Starting bot (polling)...")
     app.run_polling()
 
 if __name__ == "__main__":
