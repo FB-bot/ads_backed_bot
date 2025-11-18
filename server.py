@@ -11,14 +11,18 @@ from flask_cors import CORS
 import requests
 
 # ---------------- Config (via env) ----------------
+# ঠিক করা ENV লাইনগুলো:
 DB_PATH = os.environ.get("DB_PATH", "referral.db")
 REFERRAL_BONUS_CENTS = int(os.environ.get("REFERRAL_BONUS_CENTS", "50"))  # 50 cents => 0.5 USDT
-BOT_TOKEN = os.environ.get("8213937413:AAHmp7SHCITYExufiYvQtEJJbZP7Svi4Uwg")  # REQUIRED for initData verification & bot messages
-ADMIN_CHAT_ID = os.environ.get("1849126202")  # optional: admin chat id to notify
-SECRET_TOKEN = os.environ.get("noobxvau")  # optional: protect set-webhook or api
-WEBHOOK_SECRET = os.environ.get("smartearn", "change_me_secret")  # webhook path secret
-WEBAPP_URL = os.environ.get("mysmartearn.netlify.app", "")  # e.g. https://your-domain.com or t.me style webapp url
-BOT_USERNAME = os.environ.get("@mysmartearn_bot", "")  # optional, for link building
+
+# IMPORTANT: এখানে key-গুলা হলো নাম (not the token itself)
+BOT_TOKEN = os.environ.get("8213937413:AAHmp7SHCITYExufiYvQtEJJbZP7Svi4Uwg")                 # ex: 8213937413:AAHmp7...
+ADMIN_CHAT_ID = os.environ.get("1849126202")         # ex: 1849126202
+SECRET_TOKEN = os.environ.get("noobxvau")           # ex: noobxvau
+# flexible: check WEBHOOK_SECRET or legacy 'smartearn'
+WEBHOOK_SECRET = os.environ.get("noobxvau") or os.environ.get("smartearn") or "change_me_secret"
+WEBAPP_URL = os.environ.get("https://mysmartearn.netlify.app/", "")           # ex: https://mysmartearn.netlify.app
+BOT_USERNAME = os.environ.get("@mysmartearn_bot", "")       # ex: mysmartearn_bot
 
 app = Flask(__name__)
 CORS(app)
