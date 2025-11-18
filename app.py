@@ -8,11 +8,14 @@ import requests
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(name)s - %(message)s"
+)
 logger = logging.getLogger(__name__)
 
-# Read env vars at import time but do NOT exit here.
-BOT_TOKEN = os.environ.get("8213937413:AAHmp7SHCITYExufiYvQtEJJbZP7Svi4Uwg")
+# Read env vars at import time
+BOT_TOKEN = os.environ.get("8213937413:AAHmp7SHCITYExufiYvQtEJJbZP7Svi4Uwg")  # <-- ঠিক করা: ENV key "BOT_TOKEN"
 API_BASE = os.environ.get("API_BASE", "http://127.0.0.1:5000")
 REF_SECRET = os.environ.get("REF_SECRET")  # optional
 
@@ -21,40 +24,57 @@ async def post_referral_async(payload):
     headers = {"Content-Type": "application/json"}
     if REF_SECRET:
         headers["X-REF-SECRET"] = REF_SECRET
+
     loop = asyncio.get_running_loop()
+
     def do_post():
         try:
-            r = requests.post(API_BASE.rstrip('/') + "/api/referral/register", json=payload, headers=headers, timeout=8)
+            url = API_BASE.rstrip('/') + "/api/referral/register"
+            r = requests.post(url, json=payload, headers=headers, timeout=8)
             return r.status_code, r.text
         except Exception as e:
+            logger.exception("Error posting referral")
             return None, str(e)
+
     return await loop.run_in_executor(None, do_post)
 
 def extract_start_param(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Extract parameter passed to /start.
+    Supports: /start <payload> and deep links (start=...)
+    """
     # context.args works for /start <payload>
     if context.args:
         return context.args[0]
-    if update.message and update.message.text:
-        parts = update.message.text.split()
+
+    # fallback to message text (if present)
+    msg = getattr(update, "message", None) or getattr(update, "effective_message", None)
+    if msg and getattr(msg, "text", None):
+        parts = msg.text.split()
         if len(parts) > 1:
             return parts[1]
     return None
 
 async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # use effective_user / effective_message for robustness
     user = update.effective_user
-    start_param = extract_start_param(update, context)
-    await update.message.reply_text(f"স্বাগতম, {user.first_name or 'user'}! Processing start...")
+    message = update.effective_message
 
+    first_name = (user.first_name or "user") if user else "user"
+    await message.reply_text(f"স্বাগতম, {first_name}! Processing start...")
+
+    start_param = extract_start_param(update, context)
     if start_param and start_param.startswith("ref"):
-        referrer_id = start_param.replace("ref","").strip()
-        new_user_id = str(user.id)
+        referrer_id = start_param.replace("ref", "").strip()
+        new_user_id = str(user.id) if user else "unknown"
         payload = {
             "newUserId": new_user_id,
             "referrerId": str(referrer_id),
-            "first_name": user.first_name,
-            "last_name": user.last_name,
-            "username": user.username
+            "first_name": user.first_name if user else None,
+            "last_name": user.last_name if user else None,
+            "username": user.username if user else None,
         }
+
         status, text = await post_referral_async(payload)
         if status == 200:
             try:
@@ -63,20 +83,26 @@ async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     if j.get("credited"):
                         bal = j.get("referrerBalanceCents", 0) / 100.0
                         cnt = j.get("referrerReferralCount", 0)
-                        await update.message.reply_text(f"Referral verified — referrer credited. Referrer new balance: USDT {bal:.2f} (refs: {cnt})")
+                        await message.reply_text(
+                            f"Referral verified — referrer credited. Referrer new balance: USDT {bal:.2f} (refs: {cnt})"
+                        )
                     else:
-                        await update.message.reply_text("Referral recorded earlier (no new credit).")
+                        await message.reply_text("Referral recorded earlier (no new credit).")
                 else:
-                    await update.message.reply_text("Referral API returned error.")
+                    # API returned success=False
+                    err_msg = j.get("error") or "Referral API returned error."
+                    await message.reply_text(f"Referral API error: {err_msg}")
             except Exception:
-                await update.message.reply_text("Bad response from referral server.")
+                logger.exception("Failed to parse referral server response")
+                await message.reply_text("Bad response from referral server.")
         else:
-            await update.message.reply_text(f"Failed to contact referral server: {text}")
+            await message.reply_text(f"Failed to contact referral server: {text}")
     else:
-        await update.message.reply_text("No referral parameter found in /start.")
+        await message.reply_text("No referral parameter found in /start.")
 
 async def help_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("This bot supports referral links. Use t.me/YourBot?start=ref<your_id> to share.")
+    message = update.effective_message
+    await message.reply_text("This bot supports referral links. Use t.me/YourBot?start=ref<your_id> to share.")
 
 def main():
     if not BOT_TOKEN:
