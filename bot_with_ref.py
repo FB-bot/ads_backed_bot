@@ -1,117 +1,190 @@
-# bot_with_ref.py
-import os
+# server.py
+import sqlite3
+import hashlib
 import json
-import logging
-import asyncio
-import requests
-from telegram import Update
-from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
+import time
+from flask import Flask, request, jsonify, g
+from flask_cors import CORS
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(name)s - %(message)s"
-)
-logger = logging.getLogger(__name__)
+DB_PATH = 'referral.db'
+REFERRAL_BONUS_CENTS = 50  # 0.5 USDT = 50 cents (1 USDT = 100 cents)
+SECRET_TOKEN = None  # যদি চান, এখানে একটি স্ট্রিং দেন এবং client থেকে 'X-API-KEY' হিসেবে পাঠান
 
-# read env vars
-BOT_TOKEN = os.environ.get("8213937413:AAHmp7SHCITYExufiYvQtEJJbZP7Svi4Uwg")  # <-- অবশ্যই Render/Env এ BOT_TOKEN সেট করুন
-API_BASE = os.environ.get("API_BASE", "http://127.0.0.1:5000")
-REF_SECRET = os.environ.get("REF_SECRET")  # optional
+app = Flask(__name__)
+CORS(app)  # সাধারণ ক্ষেত্রে সবকিছু খুলে দিলে dev সুবিধা; production-এ origin সীমাবদ্ধ করুন
 
-async def post_referral_async(payload):
-    """Post referral in a thread to avoid blocking asyncio loop."""
-    headers = {"Content-Type": "application/json"}
-    if REF_SECRET:
-        headers["X-REF-SECRET"] = REF_SECRET
 
-    loop = asyncio.get_running_loop()
+def get_db():
+    db = getattr(g, '_database', None)
+    if db is None:
+        # enable check_same_thread=False for simple multi-thread dev servers
+        db = g._database = sqlite3.connect(DB_PATH, check_same_thread=False)
+        db.row_factory = sqlite3.Row
+    return db
 
-    def do_post():
-        try:
-            url = API_BASE.rstrip('/') + "/api/referral/register"
-            r = requests.post(url, json=payload, headers=headers, timeout=8)
-            return r.status_code, r.text
-        except Exception as e:
-            logger.exception("Error posting referral")
-            return None, str(e)
 
-    return await loop.run_in_executor(None, do_post)
+@app.teardown_appcontext
+def close_connection(exception):
+    db = getattr(g, '_database', None)
+    if db is not None:
+        db.commit()
+        db.close()
 
-def extract_start_param(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Extract parameter passed to /start.
-    Supports: /start <payload> and deep links (start=...)
-    """
-    # context.args works for /start <payload>
-    if context.args:
-        return context.args[0]
 
-    # fallback to message text (if present)
-    msg = getattr(update, "message", None) or getattr(update, "effective_message", None)
-    if msg and getattr(msg, "text", None):
-        parts = msg.text.split()
-        if len(parts) > 1:
-            return parts[1]
-    return None
+def init_db():
+    db = sqlite3.connect(DB_PATH)
+    cur = db.cursor()
+    cur.execute('''
+    CREATE TABLE IF NOT EXISTS users (
+        id TEXT PRIMARY KEY,
+        first_name TEXT,
+        last_name TEXT,
+        username TEXT,
+        balance_cents INTEGER DEFAULT 0,
+        referral_count INTEGER DEFAULT 0,
+        created_at INTEGER
+    )
+    ''')
+    cur.execute('''
+    CREATE TABLE IF NOT EXISTS referrals (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        new_user_id TEXT,
+        referrer_id TEXT,
+        payload_hash TEXT UNIQUE,
+        credited INTEGER DEFAULT 0,
+        created_at INTEGER
+    )
+    ''')
+    db.commit()
+    db.close()
 
-async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    message = update.effective_message
 
-    first_name = (user.first_name or "user") if user else "user"
-    await message.reply_text(f"স্বাগতম, {first_name}! Processing start...")
+def compute_payload_hash(payload: dict) -> str:
+    # Create deterministic hash from important fields to ensure idempotency
+    keys = ['newUserId', 'referrerId', 'initDataString']
+    pieces = []
+    for k in keys:
+        v = payload.get(k) or ''
+        if isinstance(v, (dict, list)):
+            v = json.dumps(v, sort_keys=True)
+        pieces.append(str(v))
+    s = '|'.join(pieces)
+    return hashlib.sha256(s.encode('utf-8')).hexdigest()
 
-    start_param = extract_start_param(update, context)
-    if start_param and start_param.startswith("ref"):
-        referrer_id = start_param.replace("ref", "").strip()
-        new_user_id = str(user.id) if user else "unknown"
-        payload = {
-            "newUserId": new_user_id,
-            "referrerId": str(referrer_id),
-            "first_name": user.first_name if user else None,
-            "last_name": user.last_name if user else None,
-            "username": user.username if user else None,
-        }
 
-        status, text = await post_referral_async(payload)
-        if status == 200:
-            try:
-                j = json.loads(text)
-                if j.get("success"):
-                    if j.get("credited"):
-                        bal = j.get("referrerBalanceCents", 0) / 100.0
-                        cnt = j.get("referrerReferralCount", 0)
-                        await message.reply_text(
-                            f"Referral verified — referrer credited. Referrer new balance: USDT {bal:.2f} (refs: {cnt})"
-                        )
-                    else:
-                        await message.reply_text("Referral recorded earlier (no new credit).")
-                else:
-                    err_msg = j.get("error") or "Referral API returned error."
-                    await message.reply_text(f"Referral API error: {err_msg}")
-            except Exception:
-                logger.exception("Failed to parse referral server response")
-                await message.reply_text("Bad response from referral server.")
-        else:
-            await message.reply_text(f"Failed to contact referral server: {text}")
-    else:
-        await message.reply_text("No referral parameter found in /start.")
+@app.route('/api/referral/register', methods=['POST'])
+def register_referral():
+    # Optional simple auth
+    if SECRET_TOKEN:
+        header_token = request.headers.get('X-API-KEY') or request.headers.get('Authorization')
+        if not header_token or header_token != SECRET_TOKEN:
+            return jsonify({'success': False, 'error': 'Unauthorized'}), 401
 
-async def help_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    message = update.effective_message
-    await message.reply_text("This bot supports referral links. Use t.me/YourBot?start=ref<your_id> to share.")
+    payload = request.get_json(silent=True)
+    if not payload:
+        return jsonify({'success': False, 'error': 'Invalid JSON payload'}), 400
 
-def main():
-    if not BOT_TOKEN:
-        logger.error("BOT_TOKEN is not set in environment variables. Set BOT_TOKEN and restart bot.")
-        raise SystemExit("Set BOT_TOKEN environment variable and retry.")
+    new_user_id = str(payload.get('newUserId', '')).strip()
+    referrer_id = str(payload.get('referrerId', '')).strip()
+    first_name = payload.get('first_name')
+    last_name = payload.get('last_name')
+    username = payload.get('username')
+    init_data = payload.get('initDataString') or ''
 
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
-    app.add_handler(CommandHandler("start", start_handler))
-    app.add_handler(CommandHandler("help", help_handler))
+    if not new_user_id or not referrer_id:
+        return jsonify({'success': False, 'error': 'Missing newUserId or referrerId'}), 400
 
-    logger.info("Starting bot (polling)...")
-    app.run_polling()
+    payload_hash = compute_payload_hash(payload)
+    db = get_db()
+    cur = db.cursor()
 
-if __name__ == "__main__":
-    main()
+    # Check if we've already processed this exact referral payload (idempotency)
+    cur.execute('SELECT id, credited FROM referrals WHERE payload_hash = ?', (payload_hash,))
+    row = cur.fetchone()
+    if row:
+        # Already seen this event
+        already_credited = bool(row['credited'])
+        # Get current referrer info to return
+        cur.execute('SELECT balance_cents, referral_count FROM users WHERE id = ?', (referrer_id,))
+        r = cur.fetchone()
+        balance_cents = r['balance_cents'] if r else 0
+        referral_count = r['referral_count'] if r else 0
+        return jsonify({
+            'success': True,
+            'credited': already_credited,
+            'referrerBalanceCents': balance_cents,
+            'referrerReferralCount': referral_count
+        })
+
+    # Insert referral record (not credited yet)
+    now = int(time.time())
+    cur.execute('''
+      INSERT INTO referrals (new_user_id, referrer_id, payload_hash, credited, created_at)
+      VALUES (?, ?, ?, 0, ?)
+    ''', (new_user_id, referrer_id, payload_hash, now))
+    referral_row_id = cur.lastrowid
+
+    # Ensure referrer exists in users table
+    cur.execute('SELECT id FROM users WHERE id = ?', (referrer_id,))
+    if not cur.fetchone():
+        cur.execute('''
+          INSERT INTO users (id, first_name, last_name, username, balance_cents, referral_count, created_at)
+          VALUES (?, ?, ?, ?, 0, 0, ?)
+        ''', (referrer_id, None, None, None, now))
+
+    # Now credit referrer (business rule: only credit if the referred user is NEW and hasn't been used before)
+    # We will mark referral credited and increment referrer balance and referral_count.
+    try:
+        cur.execute('''
+          UPDATE users
+          SET balance_cents = balance_cents + ?, referral_count = referral_count + 1
+          WHERE id = ?
+        ''', (REFERRAL_BONUS_CENTS, referrer_id))
+
+        cur.execute('''
+          UPDATE referrals
+          SET credited = 1
+          WHERE id = ?
+        ''', (referral_row_id,))
+        db.commit()
+    except Exception as e:
+        db.rollback()
+        return jsonify({'success': False, 'error': 'Database error', 'details': str(e)}), 500
+
+    # Return updated referrer info
+    cur.execute('SELECT balance_cents, referral_count FROM users WHERE id = ?', (referrer_id,))
+    r = cur.fetchone()
+    balance_cents = r['balance_cents'] if r else 0
+    referral_count = r['referral_count'] if r else 0
+
+    return jsonify({
+        'success': True,
+        'credited': True,
+        'referrerBalanceCents': balance_cents,
+        'referrerReferralCount': referral_count
+    })
+
+
+@app.route('/api/admin/user/<user_id>', methods=['GET'])
+def get_user(user_id):
+    # Simple admin view of a user (for debugging)
+    cur = get_db().cursor()
+    cur.execute('SELECT id, first_name, last_name, username, balance_cents, referral_count, created_at FROM users WHERE id = ?', (user_id,))
+    r = cur.fetchone()
+    if not r:
+        return jsonify({'success': False, 'error': 'User not found'}), 404
+    return jsonify({'success': True, 'user': dict(r)})
+
+
+@app.route('/api/admin/users', methods=['GET'])
+def list_users():
+    cur = get_db().cursor()
+    cur.execute('SELECT id, first_name, last_name, username, balance_cents, referral_count, created_at FROM users ORDER BY created_at DESC LIMIT 200')
+    rows = cur.fetchall()
+    return jsonify({'success': True, 'users': [dict(x) for x in rows]})
+
+
+if __name__ == '__main__':
+    init_db()
+    print("Starting referral server on http://0.0.0.0:5000")
+    app.run(host='0.0.0.0', port=5000, debug=True)
